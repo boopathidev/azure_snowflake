@@ -13,6 +13,7 @@ Azure Blob Storage → Event Grid → Snowpipe → Snowflake Table
 | File | Description |
 |------|-------------|
 | `snowflake_snowpipe_setup.sql` | Complete Snowflake setup (integration, stage, table, pipe) |
+| `azure_setup_guide.md` | Step-by-step Azure configuration guide |
 | `sample_data.csv` | Sample CSV file for testing |
 
 ## Quick Start
