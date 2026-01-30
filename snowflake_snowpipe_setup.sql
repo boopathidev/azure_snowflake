@@ -1,12 +1,13 @@
 -- =============================================================================
--- Azure Blob to Snowflake - Snowpipe Setup
+-- Azure Blob to Snowflake - Multi-Folder Snowpipe Setup
 -- =============================================================================
--- This script sets up automatic data ingestion from Azure Blob Storage
--- to Snowflake using Snowpipe.
+-- This script sets up automatic data ingestion from multiple Azure Blob folders
+-- to separate Snowflake tables using Snowpipe.
 --
--- Prerequisites:
---   - Snowflake account with ACCOUNTADMIN access
---   - Azure Storage Account and Blob Container
+-- Folders:
+--   - sales     → sales table
+--   - customers → customers table
+--   - orders    → orders table
 --
 -- Instructions:
 --   1. Replace all placeholder values (<your-...>) with your actual values
@@ -19,7 +20,6 @@
 -- =============================================================================
 -- STEP 1: Storage Integration
 -- =============================================================================
--- Creates a secure connection between Snowflake and Azure Blob Storage
 -- Run this with ACCOUNTADMIN role
 -- =============================================================================
 
@@ -33,7 +33,6 @@ CREATE OR REPLACE STORAGE INTEGRATION azure_blob_integration
   STORAGE_ALLOWED_LOCATIONS = ('azure://<your-storage-account>.blob.core.windows.net/<your-container>/');
 
 -- Get consent URL and service principal info
--- IMPORTANT: Note down AZURE_CONSENT_URL and AZURE_MULTI_TENANT_APP_NAME
 DESC STORAGE INTEGRATION azure_blob_integration;
 
 -- Grant usage to SYSADMIN role
@@ -48,19 +47,18 @@ GRANT USAGE ON INTEGRATION azure_blob_integration TO ROLE SYSADMIN;
 
 
 -- =============================================================================
--- STEP 2: Database, Schema, File Format, and Table
+-- STEP 2: Database, Schema, File Format
 -- =============================================================================
 
 USE ROLE SYSADMIN;
 
--- Create database and schema
 CREATE DATABASE IF NOT EXISTS AZURE_DATA_DB;
 CREATE SCHEMA IF NOT EXISTS AZURE_DATA_DB.RAW_DATA;
 
 USE DATABASE AZURE_DATA_DB;
 USE SCHEMA RAW_DATA;
 
--- File format for CSV files (adjust as needed)
+-- File format for CSV files
 CREATE OR REPLACE FILE FORMAT csv_format
   TYPE = 'CSV'
   FIELD_DELIMITER = ','
@@ -71,13 +69,36 @@ CREATE OR REPLACE FILE FORMAT csv_format
   TRIM_SPACE = TRUE
   ERROR_ON_COLUMN_COUNT_MISMATCH = FALSE;
 
--- Target table (MODIFY to match your data structure)
-CREATE OR REPLACE TABLE sample_data (
+
+-- =============================================================================
+-- STEP 3: Create Tables (one per folder)
+-- =============================================================================
+
+-- Table for sales folder
+CREATE OR REPLACE TABLE sales (
     id              INTEGER,
+    product         VARCHAR(255),
+    amount          DECIMAL(18,2),
+    date            DATE,
+    _loaded_at      TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    _source_file    VARCHAR(500)
+);
+
+-- Table for customers folder
+CREATE OR REPLACE TABLE customers (
+    customer_id     INTEGER,
     name            VARCHAR(255),
     email           VARCHAR(255),
-    created_date    DATE,
-    amount          DECIMAL(18,2),
+    phone           VARCHAR(50),
+    _loaded_at      TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    _source_file    VARCHAR(500)
+);
+
+-- Table for orders folder
+CREATE OR REPLACE TABLE orders (
+    order_id        INTEGER,
+    customer_id     INTEGER,
+    total           DECIMAL(18,2),
     status          VARCHAR(50),
     _loaded_at      TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
     _source_file    VARCHAR(500)
@@ -85,84 +106,136 @@ CREATE OR REPLACE TABLE sample_data (
 
 
 -- =============================================================================
--- STEP 3: External Stage
+-- STEP 4: Create Stages (one per folder)
 -- =============================================================================
 
-CREATE OR REPLACE STAGE azure_blob_stage
+-- Stage for sales folder
+CREATE OR REPLACE STAGE stage_sales
   STORAGE_INTEGRATION = azure_blob_integration
-  URL = 'azure://<your-storage-account>.blob.core.windows.net/<your-container>/'
+  URL = 'azure://<your-storage-account>.blob.core.windows.net/<your-container>/sales/'
   FILE_FORMAT = csv_format;
 
--- Verify connectivity
+-- Stage for customers folder
+CREATE OR REPLACE STAGE stage_customers
+  STORAGE_INTEGRATION = azure_blob_integration
+  URL = 'azure://<your-storage-account>.blob.core.windows.net/<your-container>/customers/'
+  FILE_FORMAT = csv_format;
+
+-- Stage for orders folder
+CREATE OR REPLACE STAGE stage_orders
+  STORAGE_INTEGRATION = azure_blob_integration
+  URL = 'azure://<your-storage-account>.blob.core.windows.net/<your-container>/orders/'
+  FILE_FORMAT = csv_format;
+
+-- Verify stages
 SHOW STAGES;
-LIST @azure_blob_stage;
+LIST @stage_sales;
+LIST @stage_customers;
+LIST @stage_orders;
 
 
 -- =============================================================================
--- STEP 4: Snowpipe
+-- STEP 5: Create Snowpipes (one per folder)
 -- =============================================================================
 
-CREATE OR REPLACE PIPE azure_snowpipe
+-- Pipe for sales folder
+CREATE OR REPLACE PIPE pipe_sales
   AUTO_INGEST = TRUE
   AS
-  COPY INTO sample_data (id, name, email, created_date, amount, status, _source_file)
+  COPY INTO sales (id, product, amount, date, _source_file)
+  FROM (
+    SELECT
+      $1::INTEGER,
+      $2::VARCHAR,
+      $3::DECIMAL(18,2),
+      $4::DATE,
+      METADATA$FILENAME
+    FROM @stage_sales
+  )
+  FILE_FORMAT = csv_format
+  ON_ERROR = 'CONTINUE';
+
+-- Pipe for customers folder
+CREATE OR REPLACE PIPE pipe_customers
+  AUTO_INGEST = TRUE
+  AS
+  COPY INTO customers (customer_id, name, email, phone, _source_file)
   FROM (
     SELECT
       $1::INTEGER,
       $2::VARCHAR,
       $3::VARCHAR,
-      $4::DATE,
-      $5::DECIMAL(18,2),
-      $6::VARCHAR,
+      $4::VARCHAR,
       METADATA$FILENAME
-    FROM @azure_blob_stage
+    FROM @stage_customers
   )
   FILE_FORMAT = csv_format
   ON_ERROR = 'CONTINUE';
 
--- Get notification_channel URL for Azure Event Grid setup
-DESC PIPE azure_snowpipe;
+-- Pipe for orders folder
+CREATE OR REPLACE PIPE pipe_orders
+  AUTO_INGEST = TRUE
+  AS
+  COPY INTO orders (order_id, customer_id, total, status, _source_file)
+  FROM (
+    SELECT
+      $1::INTEGER,
+      $2::INTEGER,
+      $3::DECIMAL(18,2),
+      $4::VARCHAR,
+      METADATA$FILENAME
+    FROM @stage_orders
+  )
+  FILE_FORMAT = csv_format
+  ON_ERROR = 'CONTINUE';
+
+-- Get notification_channel URLs for Azure Event Grid setup
+-- IMPORTANT: You need to create ONE Event Grid subscription per pipe
+SHOW PIPES;
+
+DESC PIPE pipe_sales;
+DESC PIPE pipe_customers;
+DESC PIPE pipe_orders;
 
 -- =============================================================================
 -- >>> CONFIGURE AZURE EVENT GRID <<<
--- 1. Go to Azure Portal → Storage Account → Events
--- 2. Create Event Subscription:
---    - Event Type: Blob Created
---    - Endpoint Type: Storage Queue
---    - Endpoint: Paste notification_channel URL from above
+-- Create 3 separate Event Grid subscriptions in Azure:
+--   1. For sales folder     → use notification_channel from pipe_sales
+--   2. For customers folder → use notification_channel from pipe_customers
+--   3. For orders folder    → use notification_channel from pipe_orders
+--
+-- Each subscription should filter by folder prefix:
+--   - Subject Begins With: /blobServices/default/containers/<container>/blobs/sales/
+--   - Subject Begins With: /blobServices/default/containers/<container>/blobs/customers/
+--   - Subject Begins With: /blobServices/default/containers/<container>/blobs/orders/
 -- =============================================================================
 
 
 -- =============================================================================
--- UTILITY COMMANDS (run as needed)
+-- UTILITY COMMANDS
 -- =============================================================================
 
--- Check pipe status
--- SELECT SYSTEM$PIPE_STATUS('azure_snowpipe');
+-- Check all pipe statuses
+-- SELECT SYSTEM$PIPE_STATUS('pipe_sales');
+-- SELECT SYSTEM$PIPE_STATUS('pipe_customers');
+-- SELECT SYSTEM$PIPE_STATUS('pipe_orders');
 
--- Manually refresh pipe (load existing files)
--- ALTER PIPE azure_snowpipe REFRESH;
+-- Manually refresh pipes (for existing files)
+-- ALTER PIPE pipe_sales REFRESH;
+-- ALTER PIPE pipe_customers REFRESH;
+-- ALTER PIPE pipe_orders REFRESH;
 
 -- View loaded data
--- SELECT * FROM sample_data ORDER BY _loaded_at DESC LIMIT 100;
+-- SELECT * FROM sales ORDER BY _loaded_at DESC LIMIT 100;
+-- SELECT * FROM customers ORDER BY _loaded_at DESC LIMIT 100;
+-- SELECT * FROM orders ORDER BY _loaded_at DESC LIMIT 100;
 
--- Check copy history
--- SELECT *
--- FROM TABLE(INFORMATION_SCHEMA.COPY_HISTORY(
---   TABLE_NAME => 'SAMPLE_DATA',
+-- Check copy history for each table
+-- SELECT * FROM TABLE(INFORMATION_SCHEMA.COPY_HISTORY(
+--   TABLE_NAME => 'SALES',
 --   START_TIME => DATEADD(HOUR, -24, CURRENT_TIMESTAMP())
--- ))
--- ORDER BY LAST_LOAD_TIME DESC;
+-- )) ORDER BY LAST_LOAD_TIME DESC;
 
--- Pause/Resume pipe
--- ALTER PIPE azure_snowpipe SET PIPE_EXECUTION_PAUSED = TRUE;
--- ALTER PIPE azure_snowpipe SET PIPE_EXECUTION_PAUSED = FALSE;
-
--- Drop all objects (cleanup)
--- DROP PIPE IF EXISTS azure_snowpipe;
--- DROP STAGE IF EXISTS azure_blob_stage;
--- DROP TABLE IF EXISTS sample_data;
--- DROP FILE FORMAT IF EXISTS csv_format;
--- DROP SCHEMA IF EXISTS AZURE_DATA_DB.RAW_DATA;
--- DROP DATABASE IF EXISTS AZURE_DATA_DB;
--- DROP STORAGE INTEGRATION IF EXISTS azure_blob_integration;
+-- Pause/Resume pipes
+-- ALTER PIPE pipe_sales SET PIPE_EXECUTION_PAUSED = TRUE;
+-- ALTER PIPE pipe_sales SET PIPE_EXECUTION_PAUSED = FALSE;

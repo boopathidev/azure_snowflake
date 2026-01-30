@@ -1,0 +1,6 @@
+order_id,customer_id,total,status
+1001,1,1200.00,completed
+1002,2,25.50,completed
+1003,1,75.00,pending
+1004,3,350.00,completed
+1005,4,150.00,shipped
