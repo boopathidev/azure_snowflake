@@ -1,26 +1,23 @@
 -- =============================================================================
--- Azure Blob to Snowflake - Multi-Folder Snowpipe Setup
+-- Azure Blob to Snowflake - Raw Landing Table Approach
 -- =============================================================================
--- This script sets up automatic data ingestion from multiple Azure Blob folders
--- to separate Snowflake tables using Snowpipe.
+-- This approach uses a single pipe to load ALL files into one raw table,
+-- then transforms and routes data to final tables using a scheduled task.
 --
--- Folders:
---   - sales     → sales table
---   - customers → customers table
---   - orders    → orders table
+-- Benefits:
+--   - Only 1 stage, 1 pipe, 1 Event Grid subscription
+--   - Easy to add new folders without Azure configuration changes
+--   - All data lands in one place for debugging
 --
--- Instructions:
---   1. Replace all placeholder values (<your-...>) with your actual values
---   2. Run each section in order
---   3. After Step 1, configure Azure permissions before proceeding
---   4. After Step 4, configure Azure Event Grid for auto-ingest
+-- Folder structure:
+--   - sales/      → sales table
+--   - customers/  → customers table
+--   - orders/     → orders table
 -- =============================================================================
 
 
 -- =============================================================================
 -- STEP 1: Storage Integration
--- =============================================================================
--- Run this with ACCOUNTADMIN role
 -- =============================================================================
 
 USE ROLE ACCOUNTADMIN;
@@ -32,17 +29,14 @@ CREATE OR REPLACE STORAGE INTEGRATION azure_blob_integration
   AZURE_TENANT_ID = '<your-azure-tenant-id>'
   STORAGE_ALLOWED_LOCATIONS = ('azure://<your-storage-account>.blob.core.windows.net/<your-container>/');
 
--- Get consent URL and service principal info
 DESC STORAGE INTEGRATION azure_blob_integration;
 
--- Grant usage to SYSADMIN role
 GRANT USAGE ON INTEGRATION azure_blob_integration TO ROLE SYSADMIN;
 
 -- =============================================================================
 -- >>> PAUSE HERE <<<
 -- 1. Open AZURE_CONSENT_URL in browser to grant consent
--- 2. In Azure Portal, grant "Storage Blob Data Reader" role to the
---    Snowflake service principal (AZURE_MULTI_TENANT_APP_NAME)
+-- 2. In Azure Portal, grant "Storage Blob Data Reader" role
 -- =============================================================================
 
 
@@ -58,7 +52,6 @@ CREATE SCHEMA IF NOT EXISTS AZURE_DATA_DB.RAW_DATA;
 USE DATABASE AZURE_DATA_DB;
 USE SCHEMA RAW_DATA;
 
--- File format for CSV files
 CREATE OR REPLACE FILE FORMAT csv_format
   TYPE = 'CSV'
   FIELD_DELIMITER = ','
@@ -71,10 +64,22 @@ CREATE OR REPLACE FILE FORMAT csv_format
 
 
 -- =============================================================================
--- STEP 3: Create Tables (one per folder)
+-- STEP 3: Raw Landing Table
+-- =============================================================================
+-- All files land here first, regardless of folder
+
+CREATE OR REPLACE TABLE raw_landing (
+    raw_line        VARCHAR(10000),      -- Raw CSV line as string
+    source_file     VARCHAR(500),        -- Full file path (includes folder)
+    loaded_at       TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    processed       BOOLEAN DEFAULT FALSE
+);
+
+
+-- =============================================================================
+-- STEP 4: Final Destination Tables
 -- =============================================================================
 
--- Table for sales folder
 CREATE OR REPLACE TABLE sales (
     id              INTEGER,
     product         VARCHAR(255),
@@ -84,7 +89,6 @@ CREATE OR REPLACE TABLE sales (
     _source_file    VARCHAR(500)
 );
 
--- Table for customers folder
 CREATE OR REPLACE TABLE customers (
     customer_id     INTEGER,
     name            VARCHAR(255),
@@ -94,7 +98,6 @@ CREATE OR REPLACE TABLE customers (
     _source_file    VARCHAR(500)
 );
 
--- Table for orders folder
 CREATE OR REPLACE TABLE orders (
     order_id        INTEGER,
     customer_id     INTEGER,
@@ -106,136 +109,130 @@ CREATE OR REPLACE TABLE orders (
 
 
 -- =============================================================================
--- STEP 4: Create Stages (one per folder)
+-- STEP 5: Single Stage (points to root container)
 -- =============================================================================
 
--- Stage for sales folder
-CREATE OR REPLACE STAGE stage_sales
+CREATE OR REPLACE STAGE azure_blob_stage
   STORAGE_INTEGRATION = azure_blob_integration
-  URL = 'azure://<your-storage-account>.blob.core.windows.net/<your-container>/sales/'
+  URL = 'azure://<your-storage-account>.blob.core.windows.net/<your-container>/'
   FILE_FORMAT = csv_format;
 
--- Stage for customers folder
-CREATE OR REPLACE STAGE stage_customers
-  STORAGE_INTEGRATION = azure_blob_integration
-  URL = 'azure://<your-storage-account>.blob.core.windows.net/<your-container>/customers/'
-  FILE_FORMAT = csv_format;
-
--- Stage for orders folder
-CREATE OR REPLACE STAGE stage_orders
-  STORAGE_INTEGRATION = azure_blob_integration
-  URL = 'azure://<your-storage-account>.blob.core.windows.net/<your-container>/orders/'
-  FILE_FORMAT = csv_format;
-
--- Verify stages
-SHOW STAGES;
-LIST @stage_sales;
-LIST @stage_customers;
-LIST @stage_orders;
+LIST @azure_blob_stage;
 
 
 -- =============================================================================
--- STEP 5: Create Snowpipes (one per folder)
+-- STEP 6: Single Pipe (loads everything to raw landing table)
 -- =============================================================================
 
--- Pipe for sales folder
-CREATE OR REPLACE PIPE pipe_sales
+CREATE OR REPLACE PIPE raw_landing_pipe
   AUTO_INGEST = TRUE
   AS
-  COPY INTO sales (id, product, amount, date, _source_file)
+  COPY INTO raw_landing (raw_line, source_file)
   FROM (
     SELECT
-      $1::INTEGER,
-      $2::VARCHAR,
-      $3::DECIMAL(18,2),
-      $4::DATE,
+      $1::VARCHAR,
       METADATA$FILENAME
-    FROM @stage_sales
+    FROM @azure_blob_stage
   )
   FILE_FORMAT = csv_format
   ON_ERROR = 'CONTINUE';
 
--- Pipe for customers folder
-CREATE OR REPLACE PIPE pipe_customers
-  AUTO_INGEST = TRUE
-  AS
-  COPY INTO customers (customer_id, name, email, phone, _source_file)
-  FROM (
-    SELECT
-      $1::INTEGER,
-      $2::VARCHAR,
-      $3::VARCHAR,
-      $4::VARCHAR,
-      METADATA$FILENAME
-    FROM @stage_customers
-  )
-  FILE_FORMAT = csv_format
-  ON_ERROR = 'CONTINUE';
+-- Get notification_channel for Azure Event Grid (only ONE needed)
+DESC PIPE raw_landing_pipe;
 
--- Pipe for orders folder
-CREATE OR REPLACE PIPE pipe_orders
-  AUTO_INGEST = TRUE
-  AS
-  COPY INTO orders (order_id, customer_id, total, status, _source_file)
-  FROM (
-    SELECT
-      $1::INTEGER,
-      $2::INTEGER,
-      $3::DECIMAL(18,2),
-      $4::VARCHAR,
-      METADATA$FILENAME
-    FROM @stage_orders
-  )
-  FILE_FORMAT = csv_format
-  ON_ERROR = 'CONTINUE';
-
--- Get notification_channel URLs for Azure Event Grid setup
--- IMPORTANT: You need to create ONE Event Grid subscription per pipe
-SHOW PIPES;
-
-DESC PIPE pipe_sales;
-DESC PIPE pipe_customers;
-DESC PIPE pipe_orders;
 
 -- =============================================================================
--- >>> CONFIGURE AZURE EVENT GRID <<<
--- Create 3 separate Event Grid subscriptions in Azure:
---   1. For sales folder     → use notification_channel from pipe_sales
---   2. For customers folder → use notification_channel from pipe_customers
---   3. For orders folder    → use notification_channel from pipe_orders
---
--- Each subscription should filter by folder prefix:
---   - Subject Begins With: /blobServices/default/containers/<container>/blobs/sales/
---   - Subject Begins With: /blobServices/default/containers/<container>/blobs/customers/
---   - Subject Begins With: /blobServices/default/containers/<container>/blobs/orders/
+-- STEP 7: Processing Task
 -- =============================================================================
+-- This task runs every 5 minutes to process raw data and route to final tables
+
+CREATE OR REPLACE TASK process_raw_landing
+  WAREHOUSE = COMPUTE_WH
+  SCHEDULE = '5 MINUTE'
+  AS
+  CALL process_raw_data();
+
+-- Create the stored procedure for processing
+CREATE OR REPLACE PROCEDURE process_raw_data()
+  RETURNS STRING
+  LANGUAGE SQL
+  AS
+  $$
+  BEGIN
+    -- Process SALES data
+    INSERT INTO sales (id, product, amount, date, _source_file)
+    SELECT
+      SPLIT_PART(raw_line, ',', 1)::INTEGER,
+      SPLIT_PART(raw_line, ',', 2)::VARCHAR,
+      SPLIT_PART(raw_line, ',', 3)::DECIMAL(18,2),
+      SPLIT_PART(raw_line, ',', 4)::DATE,
+      source_file
+    FROM raw_landing
+    WHERE source_file LIKE '%/sales/%'
+      AND processed = FALSE;
+
+    -- Process CUSTOMERS data
+    INSERT INTO customers (customer_id, name, email, phone, _source_file)
+    SELECT
+      SPLIT_PART(raw_line, ',', 1)::INTEGER,
+      SPLIT_PART(raw_line, ',', 2)::VARCHAR,
+      SPLIT_PART(raw_line, ',', 3)::VARCHAR,
+      SPLIT_PART(raw_line, ',', 4)::VARCHAR,
+      source_file
+    FROM raw_landing
+    WHERE source_file LIKE '%/customers/%'
+      AND processed = FALSE;
+
+    -- Process ORDERS data
+    INSERT INTO orders (order_id, customer_id, total, status, _source_file)
+    SELECT
+      SPLIT_PART(raw_line, ',', 1)::INTEGER,
+      SPLIT_PART(raw_line, ',', 2)::INTEGER,
+      SPLIT_PART(raw_line, ',', 3)::DECIMAL(18,2),
+      SPLIT_PART(raw_line, ',', 4)::VARCHAR,
+      source_file
+    FROM raw_landing
+    WHERE source_file LIKE '%/orders/%'
+      AND processed = FALSE;
+
+    -- Mark all as processed
+    UPDATE raw_landing SET processed = TRUE WHERE processed = FALSE;
+
+    RETURN 'Processing complete';
+  END;
+  $$;
+
+-- Enable the task
+ALTER TASK process_raw_landing RESUME;
 
 
 -- =============================================================================
 -- UTILITY COMMANDS
 -- =============================================================================
 
--- Check all pipe statuses
--- SELECT SYSTEM$PIPE_STATUS('pipe_sales');
--- SELECT SYSTEM$PIPE_STATUS('pipe_customers');
--- SELECT SYSTEM$PIPE_STATUS('pipe_orders');
+-- Check pipe status
+-- SELECT SYSTEM$PIPE_STATUS('raw_landing_pipe');
 
--- Manually refresh pipes (for existing files)
--- ALTER PIPE pipe_sales REFRESH;
--- ALTER PIPE pipe_customers REFRESH;
--- ALTER PIPE pipe_orders REFRESH;
+-- Manually refresh pipe
+-- ALTER PIPE raw_landing_pipe REFRESH;
 
--- View loaded data
+-- Manually run processing task
+-- CALL process_raw_data();
+
+-- Check raw landing table
+-- SELECT * FROM raw_landing ORDER BY loaded_at DESC LIMIT 100;
+
+-- Check final tables
 -- SELECT * FROM sales ORDER BY _loaded_at DESC LIMIT 100;
 -- SELECT * FROM customers ORDER BY _loaded_at DESC LIMIT 100;
 -- SELECT * FROM orders ORDER BY _loaded_at DESC LIMIT 100;
 
--- Check copy history for each table
--- SELECT * FROM TABLE(INFORMATION_SCHEMA.COPY_HISTORY(
---   TABLE_NAME => 'SALES',
---   START_TIME => DATEADD(HOUR, -24, CURRENT_TIMESTAMP())
--- )) ORDER BY LAST_LOAD_TIME DESC;
+-- Check task status
+-- SHOW TASKS;
 
--- Pause/Resume pipes
--- ALTER PIPE pipe_sales SET PIPE_EXECUTION_PAUSED = TRUE;
--- ALTER PIPE pipe_sales SET PIPE_EXECUTION_PAUSED = FALSE;
+-- Pause/Resume task
+-- ALTER TASK process_raw_landing SUSPEND;
+-- ALTER TASK process_raw_landing RESUME;
+
+-- Cleanup old processed records (run periodically)
+-- DELETE FROM raw_landing WHERE processed = TRUE AND loaded_at < DATEADD(DAY, -7, CURRENT_TIMESTAMP());
